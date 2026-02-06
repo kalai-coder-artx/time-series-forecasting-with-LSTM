@@ -1,0 +1,221 @@
+"""
+Advanced Time Series Forecasting with LSTM + Attention
+Includes Hyperparameter Tuning, Rolling CV, Attention Interpretation,
+and Statistical Baseline Comparison.
+
+Author: Kalai Arasan
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from statsmodels.tsa.arima.model import ARIMA
+
+# --------------------------------------------------
+# Data Generation
+# --------------------------------------------------
+def generate_synthetic_data(n_steps=2200):
+    """
+    Generate multivariate synthetic time series with
+    trend, seasonality, and noise.
+
+    Returns
+    -------
+    np.ndarray
+        Shape (n_steps, 3)
+    """
+    t = np.arange(n_steps)
+    x1 = np.sin(0.02 * t) + 0.002 * t + 0.3 * np.random.randn(n_steps)
+    x2 = np.cos(0.015 * t) + 0.001 * t + 0.3 * np.random.randn(n_steps)
+    x3 = 0.6 * x1 + 0.3 * x2 + 0.2 * np.random.randn(n_steps)
+    return np.vstack([x1, x2, x3]).T
+
+
+def create_sequences(data, window=30, horizon=1):
+    """
+    Convert time series to supervised learning format.
+    """
+    X, y = [], []
+    for i in range(len(data) - window - horizon):
+        X.append(data[i:i+window])
+        y.append(data[i+window:i+window+horizon])
+    return np.array(X), np.array(y)
+
+
+# --------------------------------------------------
+# Attention Model
+# --------------------------------------------------
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.score = nn.Linear(hidden_dim, 1)
+
+    def forward(self, lstm_out):
+        weights = torch.softmax(self.score(lstm_out), dim=1)
+        context = torch.sum(weights * lstm_out, dim=1)
+        return context, weights
+
+
+class LSTMAttentionModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.attn = Attention(hidden_dim)
+        self.fc = nn.Linear(hidden_dim, input_dim)
+
+    def forward(self, x):
+        lstm_out, _ = self.lstm(x)
+        context, weights = self.attn(lstm_out)
+        output = self.fc(context)
+        return output, weights
+
+
+# --------------------------------------------------
+# Metrics
+# --------------------------------------------------
+def mase(y_true, y_pred, y_naive):
+    """
+    Mean Absolute Scaled Error (MASE)
+    """
+    mae_model = np.mean(np.abs(y_true - y_pred))
+    mae_naive = np.mean(np.abs(y_true[1:] - y_naive[:-1]))
+    return mae_model / mae_naive
+
+
+def evaluate(y_true, y_pred):
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+    mae = mean_absolute_error(y_true, y_pred)
+    return rmse, mae
+
+
+# --------------------------------------------------
+# Training
+# --------------------------------------------------
+def train_model(model, loader, epochs=15, lr=0.001):
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    for _ in range(epochs):
+        model.train()
+        for X, y in loader:
+            optimizer.zero_grad()
+            preds, _ = model(X)
+            loss = loss_fn(preds, y.squeeze())
+            loss.backward()
+            optimizer.step()
+
+
+# --------------------------------------------------
+# Rolling-Origin Cross Validation
+# --------------------------------------------------
+def rolling_cv(X, y, hidden_dim):
+    rmses = []
+    for split in [1200, 1400, 1600]:
+        train_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X[:split], dtype=torch.float32),
+                torch.tensor(y[:split], dtype=torch.float32)
+            ),
+            batch_size=32,
+            shuffle=True
+        )
+
+        model = LSTMAttentionModel(input_dim=3, hidden_dim=hidden_dim)
+        train_model(model, train_loader)
+
+        model.eval()
+        with torch.no_grad():
+            preds, _ = model(torch.tensor(X[split:], dtype=torch.float32))
+
+        rmse, _ = evaluate(
+            y[split:].reshape(-1),
+            preds.numpy().reshape(-1)
+        )
+        rmses.append(rmse)
+
+    return np.mean(rmses)
+
+
+# --------------------------------------------------
+# Main Execution
+# --------------------------------------------------
+if __name__ == "__main__":
+
+    print("\n=== Methodology Summary ===")
+    print("Model: LSTM with Self-Attention")
+    print("Search Space: hidden_dim ∈ {32, 64}")
+    print("CV Strategy: Rolling-origin evaluation")
+    print("Metrics: RMSE, MAE, MASE\n")
+
+    # Data
+    raw = generate_synthetic_data()
+    scaler = MinMaxScaler()
+    scaled = scaler.fit_transform(raw)
+
+    X, y = create_sequences(scaled)
+
+    # Hyperparameter tuning
+    best_dim, best_score = None, 1e9
+    for h in [32, 64]:
+        score = rolling_cv(X, y, h)
+        print(f"Hidden Dim {h} | CV RMSE: {score:.4f}")
+        if score < best_score:
+            best_score, best_dim = score, h
+
+    print("\nBest Hidden Dimension:", best_dim)
+
+    # Final Train/Test
+    split = 1700
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X[:split], dtype=torch.float32),
+            torch.tensor(y[:split], dtype=torch.float32)
+        ),
+        batch_size=32,
+        shuffle=True
+    )
+
+    model = LSTMAttentionModel(3, best_dim)
+    train_model(model, train_loader)
+
+    model.eval()
+    with torch.no_grad():
+        preds, attn = model(torch.tensor(X[split:], dtype=torch.float32))
+
+    # Inverse scaling
+    preds_inv = scaler.inverse_transform(preds.numpy())
+    y_true_inv = scaler.inverse_transform(y[split:].reshape(-1, 3))
+
+    rmse, mae = evaluate(y_true_inv[:, 0], preds_inv[:, 0])
+    mase_val = mase(
+        y_true_inv[:, 0],
+        preds_inv[:, 0],
+        y_true_inv[:, 0]
+    )
+
+    print("\n=== Deep Learning Results ===")
+    print("RMSE:", rmse)
+    print("MAE :", mae)
+    print("MASE:", mase_val)
+
+    # Attention Interpretation
+    avg_attention = attn.mean(dim=0).numpy()
+    print("\n=== Attention Interpretation ===")
+    print("Higher weights near recent timesteps indicate")
+    print("the model focuses more on recent temporal patterns.")
+    print("Average Attention Weights (first 5):", avg_attention[:5])
+
+    # Baseline
+    arima = ARIMA(raw[:split, 0], order=(2, 1, 2)).fit()
+    forecast = arima.forecast(steps=len(raw) - split)
+
+    rmse_b, mae_b = evaluate(raw[split:, 0], forecast)
+
+    print("\n=== ARIMA Baseline ===")
+    print("RMSE:", rmse_b)
+    print("MAE :", mae_b)
+
+    print("\nDeep Learning beats ARIMA:", rmse < rmse_b)
